@@ -1,0 +1,130 @@
+
+import torch
+import torch.nn as nn
+import torchvision
+from matplotlib import pyplot as plt
+from backbone.DFormer.DFormer import DFormer_Small
+from backbone.PVTv2.pvtv2_encoder import pvt_v2_b0
+from backbone.Segformer.mix_transformer import mit_b0, mit_b1
+import torch.nn.functional as F
+import os
+from Model.norm import BasicConv2d,InformationFlowFusion
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+class END(nn.Module):
+    def __init__(self, in_channel):
+        super(END, self).__init__()
+        self.conv0 = BasicConv2d(in_channel * 2, in_channel, 3, 1, 1)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+    def forward(self, x1, x2):
+        x2 = self.up(x2)
+        out = torch.cat((x1 + x2, x1 * x2), dim=1)
+        out = self.conv0(out)
+        return out
+
+
+class decode_f(nn.Module):
+    def __init__(self, in_channel, out_channel,version=1):
+        super(decode_f, self).__init__()
+        self.conv2 = nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(out_channel, out_channel, kernel_size=3, stride=1, padding=1)
+        self.conv3 = BasicConv2d(out_channel * 2, out_channel, kernel_size=3, stride=1, padding=1)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.version = version
+    def forward(self, decode_f1, decode_f2):
+        if self.version == 1:
+            decode_f1 = self.conv1(decode_f1)
+            decode_f2 = self.up(self.conv2(decode_f2))
+        else:
+            decode_f1 = self.conv2(decode_f1)
+            decode_f2 = self.up(self.conv1(decode_f2))
+        out = self.conv3(torch.cat((decode_f1, torch.mul(decode_f1, decode_f2)), dim=1))
+        return out
+
+
+class StreamlineFusion(nn.Module):
+
+    def __init__(self):
+        super(StreamlineFusion, self).__init__()
+
+        self.flow_fusion_2 = InformationFlowFusion(128)
+        self.flow_fusion_3 = InformationFlowFusion(256)
+        self.flow_fusion_4 = InformationFlowFusion(512)
+
+        self.c1 = nn.Conv2d(64, 128, 1)
+        self.c2 = nn.Conv2d(128, 256, 1)
+        self.c3 = nn.Conv2d(256, 512, 1)
+
+        self.up2 = nn.Upsample(scale_factor=0.5, mode='bilinear')
+
+    def forward(self, s1, s2, s3, s4):
+
+        fuse1 = s1
+
+        upstream_flow_2 = self.up2(self.c1(fuse1))
+        fuse2 = self.flow_fusion_2(s2, upstream_flow_2)
+
+        upstream_flow_3 = self.up2(self.c2(fuse2))
+        fuse3 = self.flow_fusion_3(s3, upstream_flow_3)
+
+        upstream_flow_4 = self.up2(self.c3(fuse3))
+        fuse4 = self.flow_fusion_4(s4, upstream_flow_4)
+
+        return fuse1, fuse2, fuse3, fuse4
+
+
+class MCLDfoNet1(nn.Module):
+    def __init__(self, inc=256):
+        super(MCLDfoNet1, self).__init__()
+        self.dformer = DFormer_Small(pretrained=True)
+        self.fusion = END(256)
+
+        self.decode_f3 = decode_f(512, 256, version=1)
+        self.decode_f2 = decode_f(128, 256, version=2)
+        self.decode_f1 = decode_f(64, 256, version=2)
+
+        self.side_fusion2 = nn.Conv2d(256, 3, kernel_size=3, stride=1, padding=1)
+        self.side_fusion3 = nn.Conv2d(256, 3, kernel_size=3, stride=1, padding=1)
+
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.linear_out = nn.Sequential(nn.Conv2d(inc, inc//2, 3, 1, 1, bias=False),
+                                      nn.BatchNorm2d(inc//2),
+                                      nn.ReLU(True),
+                                      nn.Conv2d(inc//2, 3, 3, 1, 1, bias=False))
+        self.c1=nn.Conv2d(64,128,1)
+        self.c2 = nn.Conv2d(128, 256, 1)
+        self.c3 = nn.Conv2d(256, 512, 1)
+        self.up2 = nn.Upsample(scale_factor=0.5, mode='bilinear')
+        self.streamline_fusion=StreamlineFusion()
+    def encode_decode(self, x, d):
+        feature_list = self.dformer(x, d)
+        s1, s2, s3, s4 = feature_list[0], feature_list[1], feature_list[2], feature_list[3]
+
+        raw_size = x.size()[2:]
+        fuse1, fuse2, fuse3, fuse4 = self.streamline_fusion(s1, s2, s3, s4)
+        out3 = self.decode_f3(fuse3, fuse4)
+        out2 = self.decode_f2(fuse2, out3)
+        out1 = self.decode_f1(fuse1, out2)
+
+        T3 = F.interpolate(self.side_fusion3(out3), size=raw_size, mode='bilinear')
+        T2 = F.interpolate(self.side_fusion2(out2), size=raw_size, mode='bilinear')
+        T1 = self.fusion(out1, out2)
+        T1 = F.interpolate(self.linear_out(T1), size=raw_size, mode='bilinear')
+        return T1, T2, T3, out3, out2, out1
+
+    def forward(self, input):
+
+        rgb = input[:, :3]
+        modal_x = input[:, 3:]
+        modal_x = torch.cat((modal_x, modal_x, modal_x), dim=1)
+
+        T1, T2, T3, out3, out2, out1 = self.encode_decode(rgb, modal_x)
+
+        return T1, T2, T3, out3, out2, out1
+
+
+
+
+
