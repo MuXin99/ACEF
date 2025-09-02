@@ -1,0 +1,163 @@
+# Model/work3/Seg2.py 修改版本
+from backbone.PVTv2.pvtv2_encoder import pvt_v2_b0
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torchvision.ops import DeformConv2d
+import pywt
+import numpy as np
+from Model.norm import BasicConv2d,PerceptualHash
+from torch_geometric.nn import ChebConv
+from backbone.Segformer.mix_transformer3 import mit_b0
+import math
+
+
+class END(nn.Module):
+    def __init__(self, in_channel):
+        super(END, self).__init__()
+        self.conv0 = BasicConv2d(in_channel * 2, in_channel, 3, 1, 1)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+    def forward(self, x1, x2):
+        x2 = self.up(x2)
+        out1 = x1 + x2
+        out2 = x1 * x2
+        out = torch.cat((out1, out2), dim=1)
+        out = self.conv0(out)
+        return out
+
+
+class decode_f(nn.Module):
+    def __init__(self, in_channel, out_channel, version=1, codebook_size=256, embedding_dim=32):
+        super(decode_f, self).__init__()
+        self.conv1 = nn.Conv2d(out_channel * 2, out_channel, 1)
+        self.conv2 = nn.Conv2d(in_channel, out_channel, 1)
+        self.fusion = BasicConv2d(out_channel * 2, out_channel, 3, 1, 1)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.version = version
+        self.embedding = nn.Embedding(codebook_size, embedding_dim)
+        self.pre_quant_conv = nn.Conv2d(out_channel, embedding_dim, 1)
+        self.post_quant_conv = nn.Conv2d(embedding_dim, out_channel, 1)
+
+    def forward(self, decode_f1, decode_f2):
+        if self.version == 1:
+            decode_f1 = self.conv1(decode_f1)
+            decode_f2 = self.up(self.conv2(decode_f2))
+        elif self.version == 2:
+            decode_f2 = self.up(decode_f2)
+        else:
+            decode_f1 = self.conv2(decode_f1)
+            decode_f2 = self.up(decode_f2)
+        out = self.fusion(torch.cat((decode_f1, torch.mul(decode_f1, decode_f2)), dim=1))
+        return out
+
+
+class EnhancedDepthInjector(nn.Module):
+
+    def __init__(self, depth_channels, feature_channels, hash_size=8):
+        super().__init__()
+
+        self.depthwise_conv = nn.Conv2d(depth_channels, depth_channels, 3, padding=1)
+        self.pointwise_conv1 = nn.Conv2d(depth_channels, feature_channels // 2, 1)
+        self.bn1 = nn.BatchNorm2d(feature_channels // 2)
+
+        self.depthwise_conv2 = nn.Conv2d(feature_channels // 2, feature_channels // 2, 3, padding=1)
+        self.pointwise_conv2 = nn.Conv2d(feature_channels // 2, feature_channels, 1)
+        self.bn2 = nn.BatchNorm2d(feature_channels)
+        self.perceptual_hash = PerceptualHash(hash_size=hash_size, num_bands=3)
+
+    def forward(self, depth, rgb_feature):
+        depth_resized = F.adaptive_avg_pool2d(depth, rgb_feature.shape[-2:])
+        x = self.depthwise_conv(depth_resize)
+        x = F.relu(self.bn1(self.pointwise_conv1(x)))
+        x = self.depthwise_conv2(x)
+        processed_depth = F.relu(self.bn2(self.pointwise_conv2(x)))
+        hash_attention = self.perceptual_hash(depth_resized)
+        attended_depth = processed_depth * hash_attention
+        enhanced_feature = rgb_feature +attended_depth
+
+        return enhanced_feature
+
+
+class MCLSeg_Net2(nn.Module):
+    def __init__(self, inc=64):
+        super(MCLSeg_Net2, self).__init__()
+
+        self.stage_r = mit_b0()
+        if self.training:
+            self.stage_r.init_weights(
+                "/media/user/shuju/PotCrackSeg_jzj/backbone/Segformer/mit_b0.pth")
+
+        self.layer1_r = self.stage_r.layer1
+        self.layer2_r = self.stage_r.layer2
+        self.layer3_r = self.stage_r.layer3
+        self.layer4_r = self.stage_r.layer4
+
+        self.depth_injectors = nn.ModuleDict({
+            'layer1': EnhancedDepthInjector(3, 32, hash_size=18),  
+            'layer2': EnhancedDepthInjector(3, 64, hash_size=18),
+            'layer3': EnhancedDepthInjector(3, 160, hash_size=18),
+            'layer4': EnhancedDepthInjector(3, 256, hash_size=18),  
+        })
+
+        self.fusion = END(64)
+        self.decode_f3 = decode_f(256, inc, version=1)
+        self.decode_f2 = decode_f(64, inc, version=2)
+        self.decode_f1 = decode_f(32, inc, version=3)
+
+        self.side_fusion2 = nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+        self.linear_out = nn.Sequential(
+            nn.Conv2d(inc, inc // 2, 1),
+            nn.BatchNorm2d(inc // 2),
+            nn.ReLU(True),
+            nn.Conv2d(inc // 2, 3, 3, 1, 1, bias=False)
+        )
+
+        self.con1 = nn.Conv2d(160, 128, 1)
+        self.c1 = nn.Conv2d(32, 64, 1)
+        self.c2 = nn.Conv2d(64, 128, 1)
+        self.c3 = nn.Conv2d(128, 256, 1)
+        self.up2 = nn.Upsample(scale_factor=0.5, mode='bilinear')
+
+    def forward(self, rgb, depth_generated=None):
+        x = rgb.size()[2:]
+
+
+        r1 = self.layer1_r(rgb)
+        if depth_generated is not None:
+            r1 = self.depth_injectors['layer1'](depth_generated, r1)
+
+        r2 = self.layer2_r(r1)
+        if depth_generated is not None:
+            r2 = self.depth_injectors['layer2'](depth_generated, r2)
+
+        r3 = self.layer3_r(r2)
+        if depth_generated is not None:
+            r3 = self.depth_injectors['layer3'](depth_generated, r3)
+
+        r4 = self.layer4_r(r3)
+        if depth_generated is not None:
+            r4 = self.depth_injectors['layer4'](depth_generated, r4)
+
+        r3 = self.con1(r3)
+
+        fuse1 = r1
+        fuse2 = r2 + self.up2(self.c1(fuse1))
+        fuse3 = r3 + self.up2(self.c2(fuse2))
+        fuse4 = r4 + self.up2(self.c3(fuse3))
+
+        out3 = self.decode_f3(fuse3, fuse4)
+        out2 = self.decode_f2(fuse2, out3)
+        out1 = self.decode_f1(fuse1, out2)
+        T1 = self.fusion(out1, out2)
+
+        T3 = F.interpolate(self.side_fusion2(out3), size=x, mode='bilinear')
+        T2 = F.interpolate(self.side_fusion2(out2), size=x, mode='bilinear')
+        T1 = F.interpolate(self.linear_out(T1), size=x, mode='bilinear')
+        if depth_generated is not None:
+            print('RGB + Depth mode')
+        else:
+            print('RGB only mode')
+        return T1, T2, T3, out3, out2, out1
+
+
